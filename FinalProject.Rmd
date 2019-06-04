@@ -1,0 +1,428 @@
+---
+title: "An Exploratory Analysis of NBA Data Through the Data Science Pipeline"
+author: "Andrew Natarian"
+date: "May 22, 2019"
+output:
+  html_document:
+    fig_height: 8
+    fig_width: 11
+    df_print: paged
+bibliography: bibliography.bib
+nocite: '@*'
+knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_file = 'index.html') })
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(rvest)
+library(stringr)
+library (plyr)
+library(dplyr)
+library(knitr)
+library(kableExtra)
+library(DT)
+```
+
+#### This tutorial will walk through the data science pipeline, using R in RStudio, to analyze the last 20 years of NBA data between 2000 and 2019 in an attempt to better understand the variables that impact a winning NBA season and team success trends.
+***
+
+##  Data Scraping, Parsing, & Management
+
+#### We will organize two separate data frames of NBA data: one with team data and one with player data. The player data will be pulled from [BasketballReference.com](https://www.basketball-reference.com/). We'll combine the player totals and player advanced stats data so that we have all of the recorded player statistics. The team data will be pulled from [http://www.nbaminer.com/](http://www.nbaminer.com/four-factors/). Basketball Reference did not have a link from which we could grab the team data tables we'll need, but NBA Miner has the team statistics we will be interested in.
+
+#### First, we scrape the player data from Basketball Reference. We'll grab each of the separate tables for total and advanced statistics, then join them on the similar columns. Add a year column to keep track of each season.
+
+```{r player_data}
+player_data <- data.frame() # initialize a data frame to dump the player data into
+
+# get all player data from the 2000 season to the 2019 season
+for (year in c(2000:2019)) {
+  url_player_totals <- paste("https://www.basketball-reference.com/leagues/NBA_",year,"_totals.html", sep = "")
+  url_player_advanced <- paste("https://www.basketball-reference.com/leagues/NBA_",year,"_advanced.html", sep = "")
+  
+  # select player totals stats table by id
+  player_totals <- url_player_totals %>%
+    read_html() %>%
+    html_node("#totals_stats") %>%
+    html_table()
+  player_totals <- player_totals[colSums(!is.na(player_totals)) > 0] # delete empty columns
+  
+  # select advanced player stats table by id
+  player_advanced <- url_player_advanced %>%
+    read_html() %>%
+    html_node("#advanced_stats") %>%
+    html_table()
+  player_advanced <- player_advanced[colSums(!is.na(player_advanced)) > 0] # delete empty columns
+  
+  # join the player totals and player advanced tables
+  season_player_data <- join(player_totals, player_advanced, by = c("Player", "Rk", "Pos", "Age", "Tm", "G", "MP"), match = "first") %>% # join both data sets by Player
+    add_column(Year = year, .before = 1) %>% # add column for year
+    within(rm("Rk")) # remove unnecessary column
+  
+  # append the current season's data to our dataframes for team and player statistics
+  player_data <- rbind(player_data,season_player_data) # bind this year's player data with the rest of the player data
+  
+  # remove the unnecessary tables
+  rm(player_totals)
+  rm(player_advanced)
+  rm(season_player_data)
+}
+```
+
+#### Now, we scrape the team data from NBA Miner.  We'll remove the columns we don't care about like opposing team statistics. Then, insert columns for statistics we'll look at like win-loss percentages, regular season team rank, and year. Rename the columns to represent the names of statistics recorded by the NBA.
+
+```{r team_data, warning=FALSE}
+team_data <- data.frame() # initialize a data frame to dump the team data into
+
+for (year in c(1:20)) {
+  url_team <- paste("http://www.nbaminer.com/nbaminer_nbaminer/four_factors.php?operation=eexcel&partitionpage=",year,"&partition2page=", sep = "")
+  
+  season_colnames <- url_team %>%
+    read_html() %>%
+    html_nodes("table>tr:nth-child(1)>td") %>%
+    html_text()
+  
+   season_data <- read_html(url_team) %>%
+    html_node("table") %>%
+    html_table() %>%
+    as_data_frame()
+   
+   season_data <- season_data[-1,] # drop the first row which had the headers
+   
+   season_data <- season_data %>%
+     magrittr::set_colnames(season_colnames) %>%
+    add_column(Year = 2020-year, .before = 1) # add column for year
+   
+    # only keep cols we care about
+   season_data <- subset(season_data, select = c("Year","Team","Team EFg%","Team FT Rate","Team TO Rate","Team Off. Reb.%","Win","Loss")) %>%
+    # rename cols to match basketball statistics terms
+    rename(c('Team EFg%'='eFG%','Team FT Rate'='FT%','Team TO Rate'='TOV%','Team Off. Reb.%'='ORB%','Win'='W','Loss'='L')) %>%
+    type_convert(col_types = cols('W' = col_integer(), 'L' = col_integer())) # convert column types to allow division of wins and losses
+  
+    season_data <- season_data %>%
+     add_column('W/L%' = season_data$'W' / (season_data$'W' + season_data$'L')) # add col for W/L%
+    
+   season_data <- season_data %>%
+     arrange(desc(season_data$'W/L%')) %>% 
+     add_column(Rk = seq(1:nrow(season_data))) # add column to show their rank that season
+   
+   team_data <- rbind(team_data,season_data) # bind this year's team data with the rest of the team data
+}
+
+# remove the unnecessary tables
+  rm(season_data)
+  rm(season_colnames)
+  rm(year)
+```
+
+#### Now that we have all the data, we'll clean it up a little more. Remove the empty rows, replace any empty entries with NAs, and convert the column types.
+
+```{r data_cleaning}
+# remove extra header rows inside table
+player_data <- player_data[!player_data$Player=="Player",]
+
+# replace all empty entries with NA
+team_data[team_data == ""] <- NA
+player_data[player_data == ""] <- NA
+player_data[player_data == "TOT"] <- "TOR" # Toronto Raptors mis-abbreviated at TOT
+
+rownames(player_data) <- 1:nrow(player_data) # reset row names by indexes
+
+# some years listed a "*" after a player's name if they were an All-Star, but it was not consistently documented for each year, so it will be removed to avoid confusion
+player_data <- player_data %>%
+  mutate(Player = ifelse(substr(Player, nchar(Player), nchar(Player)) == "*", substr(Player, 1, nchar(Player)-1), Player))
+
+# convert columns for player dataframe to appropriate types
+player_data <- player_data %>%
+  type_convert(col_types = cols(
+                                Year = col_integer(),
+                                Player = col_character(),
+                                Pos = col_character(),
+                                Age = col_integer(),
+                                Tm = col_character(),
+                                G = col_integer(),
+                                GS = col_integer(),
+                                MP = col_integer(),
+                                FG = col_integer(),
+                                FGA = col_integer(),
+                                'FG%' = col_double(),
+                                '3P' = col_integer(),
+                                '3PA' = col_integer(),
+                                '3P%' = col_double(),
+                                '2P' = col_integer(),
+                                '2PA' = col_integer(),
+                                '2P%' = col_double(),
+                                'eFG%' = col_double(),
+                                FT = col_integer(),
+                                FTA = col_integer(),
+                                'FT%' = col_double(),
+                                ORB = col_integer(),
+                                DRB = col_integer(),
+                                TRB = col_integer(),
+                                AST = col_integer(),
+                                STL = col_integer(),
+                                BLK = col_integer(),
+                                TOV = col_integer(),
+                                PF = col_integer(),
+                                PTS = col_integer(),
+                                PER = col_double(),
+                                'TS%' = col_double(),
+                                '3PAr' = col_double(),
+                                FTr = col_double(),
+                                'ORB%' = col_double(),
+                                'DRB%' = col_double(),
+                                'TRB%' = col_double(),
+                                'AST%' = col_double(),
+                                'STL%' = col_double(),
+                                'BLK%' = col_double(),
+                                'TOV%' = col_double(),
+                                'USG%' = col_double(),
+                                OWS = col_double(),
+                                DWS = col_double(),
+                                WS = col_double(),
+                                'WS/48' = col_double(),
+                                OBPM = col_double(),
+                                DBPM = col_double(),
+                                BPM = col_double(),
+                                VORP = col_double()
+                              )
+                )
+```
+
+#### Combing through our aggregate data we've found 1,909 unique players across 35 unique teams from 2000 to 2019. Our data sets from the last 20 NBA seasons consist of a total of 595 team observations with 10 features and 11,576 player observations with 50 features.
+
+## Peek at the dataset {.tabset .tabset-fade .tabset-pill}
+
+### Team Data
+
+```{r peek_team_data, echo=FALSE}
+datatable(head(team_data, nrow(team_data)), options = list(pageLength = 10, scrollX = T))
+```
+
+### Player Data
+
+```{r peek_player_data, echo=FALSE, warning=FALSE}
+player_data <- player_data %>% arrange(desc(Year),Player,Tm)
+datatable(head(player_data, nrow(player_data)), options = list(pageLength = 10, scrollX = T))
+```
+
+  
+## Exploratory Data Analysis
+  
+##### First, we can look at the variablility in some of the key basketball statistics. The "Four Factors" in NBA statistics are known to be eFG%, FT%, ORB%, and TOV%. These are the metrics believed to be correlated most closely with winning basketball games. These factors can also identify a team's strategic strengths and weaknesses. BPM is another statistic commonly used to evaluate a player; it estimates their performance relative to the league average.
+
+```{r variability_plot, fig.height = 8, fig.width = 11}
+player_data %>% summarize(stat=c('eFG%','FT%','TOV%','ORB%','BPM'), value=c(sd(player_data$`eFG%`,na.rm=TRUE), sd(player_data$`FT%`,na.rm=TRUE), sd(player_data$`TOV%`,na.rm=TRUE), sd(player_data$`ORB%`,na.rm=TRUE), sd(BPM,na.rm=TRUE))) %>%
+  ggplot(mapping=aes(x=stat, y=value)) +
+    geom_bar(stat="identity") +
+    geom_text(aes(label=format(round(value, 2), nsmall = 2)), position=position_dodge(width=0.9), vjust=-0.25) +
+    ggtitle("Variability in Basketball Statistics across Players") +
+    xlab("statistic") +
+    ylab("standard deviation")
+```
+
+#### It appears that eFG% and FT% do not change much across players (no more than 15%), while BPM, ORB%, and TOV% vary more.  
+  
+#### To get a rough look at the success of each team over the years, we can plot their win-loss percentages over time. We'll plot each point so we can see each team's W/L%. We'll also add regression lines to get an idea of the trend of each team's win-loss percentage.
+```{r plot_success_over_time, fig.height = 8, fig.width = 11}
+# plot of teams' success over the years: single scatter plot of winning percentage over time
+team_data %>%
+  ggplot(aes(x=team_data$Year, y=team_data$'W/L%', color=Team)) +
+  geom_point() +
+  geom_smooth(method='lm', se=FALSE) +
+  ggtitle("Team Winning Percentage Over Time \n Between 1999 and 2019") +
+  xlim(2000, 2019) +
+  xlab("Year") + 
+  ylab("Winning Percentage") +
+  theme(legend.position="bottom", legend.key.size = unit(0.5, "cm"), legend.text = element_text(size=6))
+```
+
+#### Being that there are 35 different teams, the plot can be hard to read. Although, we can see that over the course of 20 years there appear to be only a couple teams which have had a steady increase in success. We can take a closer look at the win trajectories of each team by looking at the interaction model represented by the regression lines.
+
+## We can make a regression model to estimate the trajectory of win-loss percentages for each team
+
+#### This will be a multi-variate regression model with interaction terms between the year and team.
+
+```{r interaction_model}
+# looking at the slope estimates of each of the team's regression lines
+# linear regression model for W/L%, including a term for an interaction between Year and Team
+interaction_model <- lm(team_data$'W/L%' ~Year*Team, data = team_data)
+
+# cleaning up the data frame to present each team with the slope of their regression line and the p value
+team_success_rates <- data.frame(term = broom::tidy(interaction_model)[,1], estimate = broom::tidy(interaction_model)[,2]) %>% 
+  subset(grepl("Year.*",term))
+team_success_rates <- team_success_rates %>%
+  mutate(term = gsub("Year:Team","",team_success_rates$term)) 
+team_success_rates <- team_success_rates[with(team_success_rates, order(-estimate)),] %>% structure(row.names=seq(1:nrow(team_success_rates)))
+team_success_rates <- team_success_rates %>%
+  mutate(term = gsub("^Year$","Atlanta Hawks",team_success_rates$term)) %>% # set 'Year' term to 'Atlanta Hawks' estimate since it is the default paramter, when the coefficients for all other teams are 0
+  arrange(desc(estimate))
+team_success_rates
+```
+
+#### The model gives us estimates for the rate at which each team's win-loss percentage changes.
+
+## Testing the model
+
+#### We'll plot the residuals against the year to see how good of an estimate the interaction between year and team is. This will show us the distribution of the residuals, the distance between each data point and the regression line, for each year.
+
+```{r plot_residuals_vs_year, fig.height = 8, fig.width = 11}
+# residuals vs. year violin plot for the interaction model
+broom::augment(interaction_model) %>%
+  ggplot(aes(x=factor(Year), y=.resid)) +
+    geom_violin() +
+    labs(title="Residuals vs. Year",
+         x = "year",
+         y = "residual")
+```
+
+#### With the interaction model, our plot of residuals matches the assumptions of a linear regression model. The mean of the residuals is approximately zero and the distribution of residuals is symmetric, which shows us that our interaction model is an accurate estimate.
+
+
+#### We can also plot the residuals against the fitted values to verify the accuracy of the model.
+
+```{r exercise8_fittedPlot, fig.height = 8, fig.width = 11}
+# residuals vs. year violin plot for the interaction model
+broom::augment(interaction_model) %>%
+  ggplot(aes(x=.fitted, y=.resid)) +
+    geom_point() +
+    geom_smooth(method = lm) +
+    labs(title="Residuals vs. Fitted",
+         x = "fitted values",
+         y = "residual")
+```
+
+#### Our fitted values plotted against the residual values reassures us that the assumptions of the linear regression model are matched. We can see the spread of residuals is independent of the fitted values. No residuals are larger than 0.4 in magnitude.  The fact that the residuals are centered around zero suggests that a linear fit works well. The linear regression interaction model is appropriate.
+
+## Let's see what our model has shown us
+
+#### We now have a model to estimate the win-loss trajectories of NBA teams. The model gives us a better idea of the success rates of each team in the last 20 years.  We can use this to see if teams have been on the rise or if they've been falling down the ranks. Let's look at those teams with positive success rates. We'll make a plot of win-loss percentages over time again, but this time only looking at the teams that have positive slopes from our regression model.
+
+```{r top_team_trajectories, fig.height = 8, fig.width = 11}
+filtered_teams <- team_data %>%
+    filter(Team=="Golden State Warriors" | Team=="Atlanta Hawks" | Team=="Los Angeles Clippers" | Team=="Vancouver Grizzlies" | Team=="Chicago Bulls" | Team=="Toronto Raptors" | Team=="Houston Rockets" | Team=="San Antonio Spurs" )
+filtered_teams %>%
+    ggplot(aes(x=Year, y=filtered_teams$'W/L%', color=Team)) +
+    geom_smooth(method=lm, se = FALSE) +
+    ggtitle("Team Winning Percentage Over Time \n Between 1999 and 2019") +
+    xlim(2000, 2019) +
+    xlab("Year") + 
+    ylab("Winning Percentage") +
+    theme(legend.position="bottom", legend.key.size = unit(0.5, "cm"), legend.text = element_text(size=6))
+```
+
+#### As we saw from the estimates generated by the regression model, the Golden State Warriors are the team with fastest growing win-loss percentage over the last twenty years.  We can also see that the San Antonio Spurs win-loss percentage over time, although not increasing, has been consistently higher than most teams.
+
+## Now let's take a look at the history of which teams had the best seasons
+
+#### We'll find the number of times each team finshed the season with the best record in the NBA. Then we'll plot the count of number one ranks for each team on a bar graph.
+
+```{r barchart_of_best_teams, fig.height = 8, fig.width = 11}
+# add column to track how many times each team was the best team of the season
+list_of_top_rank_teams <- ddply(team_data %>% filter(Rk == 1) %>% group_by(Team), "Team", numcolwise(sum)) %>% select(Rk, Team) %>% rename(c('Rk'='Best_Rank'))
+team_success_rates <- merge(team_success_rates, list_of_top_rank_teams %>% rename(c('Team'='term')), by="term", all=T) %>%
+  mutate(Best_Rank = ifelse(is.na(Best_Rank), 0, Best_Rank))
+
+# bar graph of #1 ranks by team
+team_success_rates %>% arrange(desc(Best_Rank)) %>%
+    ggplot(mapping=aes(x=term, y=Best_Rank, color = term)) +
+    geom_bar(stat="identity") +
+    ggtitle("Count of Best Team Record by Team") +
+    ylab("Count of #1 Ranks") +
+    theme(axis.text.x = element_text(angle=90, vjust=0.5)) +
+    scale_x_discrete("Team", breaks=c("Golden State Warriors","Chicago Bulls","Cleveland Cavaliers","Dallas Mavericks","San Antonio Spurs","Boston Celtics","Detroit Pistons","Houston Rockets","Indiana Pacers","Los Angeles Lakers","Miami Heat","Milwaukee Bucks","Phoenix Suns","Sacramento Kings")) +
+    theme(legend.position="bottom", legend.key.size = unit(0.5, "cm"), legend.text = element_text(size=6)) +
+    scale_color_discrete(name="Team")
+```
+
+#### Looking at this bar chart we can see that, despite the dominance it appears a few select teams in the NBA have, the title of best team record has been spread across many different teams. There are 14 different teams have held the best regular season record in the last 20 years. Of those 14 teams, only 5 have done it more than once. The Golden State Warriors, the most recently dominant team in the NBA, is the only team to finish the season with the best record in the NBA 3 times. Interestingly enough, we find that the teams with increasing win-loss percentages were not necessarily the same teams as those which have held the best regular season record.
+
+## Let's look at the progress of all 35 teams over the last 20 years.
+
+```{r facet_plot, fig.height = 8, fig.width = 11}
+ggplot(team_data, aes(x=Year, y=team_data$'W/L%', color=Team)) +
+       geom_point() +
+       ggtitle("Win-Loss Perentage of NBA Teams Over Time\n(2000-2019)") +
+       xlab("Year") +
+       ylab("W/L%") +
+       scale_y_continuous(labels = scales::number_format(accuracy = 0.01, decimal.mark = '.')) +
+       theme(plot.title = element_text(lineheight=.8, face="bold", size = 20)) +
+       theme(text = element_text(size=18)) +
+       facet_wrap(~Team, nc=5) + # create faceted panel
+       theme(legend.position="none") # hide legend for facet plot
+```
+
+#### Success for most teams appears to shift up and down over time. The clear outlier of all teams is the Golden State Warriors, with a largely increasing win-loss percentage over the last 20 years.
+
+## Conclusion
+
+#### We can generate a multi-variate linear regression model with interaction terms between year and team to estimate the trajectory of win-loss percentages for teams. This allows us to see which teams have been improving, and which teams have been getting worse, over time. We consistently observed the Golden State Warriors to be an outlier across team trends. They've won 3 of the last 4 NBA Championships, and it's clear to see their path to dominance. Overall, there aren't teams consistently at the top of the league in wins, but there are, only a few, teams which continue to perform at a high level. The data we observed has shown us how rare stability in winning is. Success in the NBA is difficult to sustain.
+
+## Glossary
+
+##### _Team Data_
+__Year:__ Year the NBA season ended  
+__Team:__ Team  
+__eFG%:__ Effective Field Goal Percentage; this statistic adjusts for the fact that a 3-point field goal is worth one more point than a 2-point field goal  
+__FT%:__  Free Throws Per Field Goal Attempt  
+__TOV:__ Turnover Percentage; an estimate of turnovers committed per 100 plays  
+__ORB%:__ Offensive Rebound Percentage; an estimate of the percentage of available offensive rebounds a player grabbed while he was on the floor  
+__W:__ Wins  
+__L:__ Losses  
+__W/L%:__ Win-Loss Percentage  
+__Rk:__ Rank  
+  
+##### _Player Data_
+__Year:__ Year the NBA season ended  
+__Player:__ Name of player  
+__Pos:__ Position  
+__Age:__ Age; player age on February 1 of the given season  
+__Tm:__ Team  
+__G:__ Games  
+__GS:__ Games Started  
+__MP:__ Minutes Played  
+__FG:__ Field Goals (includes both 2-point field goals and 3-point field goals)  
+__FGA:__ Field Goal Attempts (includes both 2-point field goal attempts and 3-point field goal attempts)  
+__FG%:__ ield Goal Percentage; the formula is FG / FGA  
+__3P:__ 3-Point Field Goals  
+__3PA:__ 3-Point Field Goal Attempts  
+__3P%:__ 3-Point Field Goal Percentage; the formula is 3P / 3PA  
+__2P:__ 2-Point Field Goals  
+__2PA:__ 2-Point Field Goal Attempts  
+__2P%:__ 2-Point Field Goal Percentage; the formula is 2P / 2PA  
+__eFG%:__ Effective Field Goal Percentage; the formula is (FG + 0.5 * 3P) / FGA. This statistic adjusts for the fact that a 3-point field goal is worth one more point than a 2-point field goal. For example, suppose Player A goes 4 for 10 with 2 threes, while Player B goes 5 for 10 with 0 threes. Each player would have 10 points from field goals, and thus would have the same effective field goal percentage (50%).  
+__FT:__ Free Throws  
+__FTA:__ Free Throw Attempts  
+__FT%:__ Free Throw Percentage; the formula is FT / FTA  
+__ORB:__ Offensive Rebounds  
+__DRB:__ Defensive Rebounds  
+__TRB:__ Total Rebounds  
+__AST:__ Assists  
+__STL:__ Steals  
+__BLK:__ Blocks  
+__TOV:__ Turnovers  
+__PF:__ Personal Fouls  
+__PTS:__ Points  
+__PER:__ Player Efficiency Rating; PER is a rating developed by ESPN.com columnist John Hollinger. In John's words, "The PER sums up all a player's positive accomplishments, subtracts the negative accomplishments, and returns a per-minute rating of a player's performance."  
+__TS%:__ True Shooting Percentage; the formula is PTS / (2 * TSA). True shooting percentage is a measure of shooting efficiency that takes into account field goals, 3-point field goals, and free throws.  
+__3PAr:__ 3-Point Attempt Rate; Percentage of FG attempts from 3-Point Range  
+__FTr:__ Free Throw Attempt Range; Number of FT Attempts Per FG Attempt  
+__ORB%:__ Offensive Rebound Percentage; the formula is 100 * (ORB * (Tm MP / 5)) / (MP * (Tm ORB + Opp DRB)). Offensive rebound percentage is an estimate of the percentage of available offensive rebounds a player grabbed while he was on the floor.  
+__DRB%:__ Defensive Rebound Percentage; the formula is 100 * (DRB * (Tm MP / 5)) / (MP * (Tm DRB + Opp ORB)). Defensive rebound percentage is an estimate of the percentage of available defensive rebounds a player grabbed while he was on the floor.  
+__TRB%:__ Total Rebound Percentage (available since the 1970-71 season in the NBA); the formula is 100 * (TRB * (Tm MP / 5)) / (MP * (Tm TRB + Opp TRB)). Total rebound percentage is an estimate of the percentage of available rebounds a player grabbed while he was on the floor.  
+__AST%:__ Assist Percentage (available since the 1964-65 season in the NBA); the formula is 100 * AST / (((MP / (Tm MP / 5)) * Tm FG) - FG). Assist percentage is an estimate of the percentage of teammate field goals a player assisted while he was on the floor.  
+__STL%:__ Steal Percentage (available since the 1973-74 season in the NBA); the formula is 100 * (STL * (Tm MP / 5)) / (MP * Opp Poss). Steal Percentage is an estimate of the percentage of opponent possessions that end with a steal by the player while he was on the floor.  
+__BLK%:__ Block Percentage (available since the 1973-74 season in the NBA); the formula is 100 * (BLK * (Tm MP / 5)) / (MP * (Opp FGA - Opp 3PA)). Block percentage is an estimate of the percentage of opponent two-point field goal attempts blocked by the player while he was on the floor.  
+__TOV%:__ Turnover Percentage (available since the 1977-78 season in the NBA); the formula is 100 * TOV / (FGA + 0.44 * FTA + TOV). Turnover percentage is an estimate of turnovers per 100 plays.  
+__USG%:__ Usage Percentage (available since the 1977-78 season in the NBA); the formula is 100 * ((FGA + 0.44 * FTA + TOV) * (Tm MP / 5)) / (MP * (Tm FGA + 0.44 * Tm FTA + Tm TOV)). Usage percentage is an estimate of the percentage of team plays used by a player while he was on the floor.  
+__OWS:__ Offensive Win Shares  
+__DWS:__ Defensive Win Shares  
+__<!-- -->WS:<!-- -->__ Win Shares; an estimate of the number of wins contributed by a player  
+__WS/48:__ Win Shares Per 48 Minutes (available since the 1951-52 season in the NBA); an estimate of the number of wins contributed by the player per 48 minutes (league average is approximately 0.100).  
+__OBPM:__ Offensive Box Plus/Minus; A box score estimate of the offensive points per 100 possessions a player contributed above a league-average player, translated to an average team  
+__DBPM:__ Defensive Box Plus/Minus; A box score estimate of the defensive points per 100 possessions a player contributed above a league-average player, translated to an average team  
+__BPM:__ Box Plus/Minus; A box score estimate of the points per 100 possessions a player contributed above a league-average player, translated to an average team  
+__VORP:__ Value Over Replacement Player; a box score estimate of the points per 100 TEAM possessions that a player contributed above a replacement-level (-2.0) player, translated to an average team and prorated to an 82-game season. Multiply by 2.70 to convert to wins over replacement.  
+
+## References

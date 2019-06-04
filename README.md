@@ -1,1 +1,1 @@
-# Data-Science-Exploratory-Analysis
+# An Exploratory Analysis of NBA Data Through the Data Science Pipeline
